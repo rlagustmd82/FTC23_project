@@ -4,6 +4,7 @@ import torch
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import scale
 from sklearn.metrics import normalized_mutual_info_score as nmi
+from sklearn.metrics import adjusted_rand_score as ari
 from pathlib import Path
 import torchvision
 import urllib.request
@@ -64,12 +65,11 @@ def dip(X, just_dip=False, is_data_sorted=False, debug=False):
 def load_c_dip_file():
     global C_DIP_FILE
     files_path = os.path.dirname(__file__)
-    print(">>>>>>>>>>>>>>>>>>>>>>>>>>>", files_path)
     if platform.system() == "Windows":
         # dip_compiled = files_path + "/dip.dll"
         dip_compiled = 'C:/Users/hyuns/Desktop/ECE60872 CourseProject/DipDECK/dip.dll'
     else:
-        dip_compiled = files_path + "/dip.so"
+        dip_compiled = "/scratch/gilbreth/kim4061/FTC23_project/dip.so"
     if os.path.isfile(dip_compiled):
         # load c file
         try:
@@ -285,14 +285,14 @@ def encode_batchwise(dataloader, model, device):
 
 
 def get_trained_autoencoder(trainloader, learning_rate, n_epochs, device, optimizer_class, loss_fn,
-                            input_dim, embedding_size, autoencoder_class):
+                            input_dim, inter_dim, embedding_size, autoencoder_class):
     if embedding_size > input_dim:
         print(
             "WARNING: embedding_size is larger than the dimensionality of the input dataset. Setting embedding_size to",
             input_dim)
         embedding_size = input_dim
     # Pretrain Autoencoder
-    autoencoder = autoencoder_class(input_dim=input_dim, embedding_size=embedding_size).to(device)
+    autoencoder = autoencoder_class(input_dim=input_dim, inter_dim= inter_dim, embedding_size=embedding_size).to(device)
     optimizer = optimizer_class(autoencoder.parameters(), lr=learning_rate)
     autoencoder.start_training(trainloader, n_epochs, device, optimizer, loss_fn)
     return autoencoder
@@ -319,8 +319,8 @@ DipDECK stuff
 """
 
 
-def _dip_deck(X, n_clusters_start, dip_merge_threshold, cluster_loss_weight, n_clusters_max, n_clusters_min, batch_size,
-              learning_rate, pretrain_epochs, dedc_epochs, optimizer_class, loss_fn, autoencoder, embedding_size,
+def _dip_deck(args, X, n_clusters_start, dip_merge_threshold, cluster_loss_weight, n_clusters_max, n_clusters_min, batch_size,
+              learning_rate, pretrain_epochs, dedc_epochs, optimizer_class, loss_fn, autoencoder, inter_dim, embedding_size,
               max_cluster_size_diff_factor, debug):
     if n_clusters_max < n_clusters_min:
         raise Exception("n_clusters_max can not be smaller than n_clusters_min")
@@ -342,15 +342,21 @@ def _dip_deck(X, n_clusters_start, dip_merge_threshold, cluster_loss_weight, n_c
                                              shuffle=False,
                                              drop_last=False)
     if autoencoder is None:
+        import autoencoder
         autoencoder = get_trained_autoencoder(trainloader, learning_rate, pretrain_epochs, device,
-                                              optimizer_class, loss_fn, X.shape[1], embedding_size,
-                                              _DipDECK_Autoencoder)
-    # Execute kmeans in embedded space - initial clustering
-    embedded_data = encode_batchwise(testloader, autoencoder, device)
-    kmeans = KMeans(n_clusters=n_clusters_start)
-    kmeans.fit(embedded_data)
-    init_centers = kmeans.cluster_centers_
-    cluster_labels_cpu = kmeans.labels_
+                                              optimizer_class, loss_fn, X.shape[1], inter_dim, embedding_size,
+                                              autoencoder._DipDECK_Autoencoder)
+    if args.initial_clustering_methods == "kmeans":
+        # Execute kmeans in embedded space - initial clustering
+        embedded_data = encode_batchwise(testloader, autoencoder, device)
+        kmeans = KMeans(n_clusters=n_clusters_start)
+        kmeans.fit(embedded_data)
+        init_centers = kmeans.cluster_centers_
+        cluster_labels_cpu = kmeans.labels_
+    elif args.initial_clustering_methods == "louvain":
+        pass
+    else:
+        print("Not available clustering method!")
     # Get nearest points to optimal centers
     centers_cpu, embedded_centers_cpu = _get_nearest_points_to_optimal_centers(X, init_centers, embedded_data)
     # Initial dip values
@@ -550,90 +556,14 @@ def _get_dip_matrix(data, dip_centers, dip_labels, n_clusters, max_cluster_size_
             dip_matrix[j][i] = dip_p_value
     return dip_matrix
 
-
-class _DipDECK_Autoencoder(torch.nn.Module):
-
-    def __init__(self, input_dim: int, embedding_size: int):
-        super(_DipDECK_Autoencoder, self).__init__()
-
-        # make a sequential list of all operations you want to apply for encoding a data point
-        self.encoder = torch.nn.Sequential(
-            # Linear layer (just a matrix multiplication)
-            torch.nn.Linear(input_dim, 500),
-            # apply an elementwise non-linear function
-            torch.nn.LeakyReLU(inplace=True),
-            torch.nn.Linear(500, 500),
-            torch.nn.LeakyReLU(inplace=True),
-            torch.nn.Linear(500, 2000),
-            torch.nn.LeakyReLU(inplace=True),
-            torch.nn.Linear(2000, embedding_size))
-
-        # make a sequential list of all operations you want to apply for decoding a data point
-        # In our case this is a symmetric version of the encoder
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(embedding_size, 2000),
-            torch.nn.LeakyReLU(inplace=True),
-            torch.nn.Linear(2000, 500),
-            torch.nn.LeakyReLU(inplace=True),
-            torch.nn.Linear(500, 500),
-            torch.nn.LeakyReLU(inplace=True),
-            torch.nn.Linear(500, input_dim),
-        )
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: input data point, can also be a mini-batch of points
-
-        Returns:
-            embedded: the embedded data point with dimensionality embedding_size
-        """
-        return self.encoder(x)
-
-    def decode(self, embedded: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            embedded: embedded data point, can also be a mini-batch of embedded points
-
-        Returns:
-            reconstruction: returns the reconstruction of a data point
-        """
-        return self.decoder(embedded)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """ Applies both encode and decode function.
-        The forward function is automatically called if we call self(x).
-        Args:
-            x: input data point, can also be a mini-batch of embedded points
-
-        Returns:
-            reconstruction: returns the reconstruction of a data point
-        """
-        embedded = self.encode(x)
-        reconstruction = self.decode(embedded)
-        return reconstruction
-
-    def start_training(self, trainloader, n_epochs, device, optimizer, loss_fn):
-        for _ in range(n_epochs):
-            for batch, _ in trainloader:
-                # load batch on device
-                batch_data = batch.to(device)
-                reconstruction = self.forward(batch_data)
-                loss = loss_fn(reconstruction, batch_data)
-                # reset gradients from last iteration
-                optimizer.zero_grad()
-                # calculate gradients and reset the computation graph
-                loss.backward()
-                # update the internal params (weights, etc.)
-                optimizer.step()
-
-
 class DipDECK():
 
-    def __init__(self, n_clusters_start=35, dip_merge_threshold=0.9, cluster_loss_weight=1, n_clusters_max=np.inf,
+    def __init__(self, args, n_clusters_start=35, dip_merge_threshold=0.9, cluster_loss_weight=1, n_clusters_max=np.inf,
                  n_clusters_min=1, batch_size=256, learning_rate=1e-3, pretrain_epochs=100, dedc_epochs=50,
-                 optimizer_class=torch.optim.Adam, loss_fn=torch.nn.MSELoss(), autoencoder=None, embedding_size=5,
+                 optimizer_class=torch.optim.Adam, loss_fn=torch.nn.MSELoss(), autoencoder=None, 
+                 inter_dim= [500,500,2000], embedding_size=5,
                  max_cluster_size_diff_factor=2, debug=False):
+        self.args = args
         self.n_clusters_start = n_clusters_start
         self.dip_merge_threshold = dip_merge_threshold
         self.cluster_loss_weight = cluster_loss_weight
@@ -646,17 +576,18 @@ class DipDECK():
         self.optimizer_class = optimizer_class
         self.loss_fn = loss_fn
         self.autoencoder = autoencoder
+        self.inter_dim = inter_dim
         self.embedding_size = embedding_size
         self.max_cluster_size_diff_factor = max_cluster_size_diff_factor
         self.debug = debug
 
     def fit(self, X):
-        labels, n_clusters, centers, autoencoder = _dip_deck(X, self.n_clusters_start, self.dip_merge_threshold,
+        labels, n_clusters, centers, autoencoder = _dip_deck(args, X, self.n_clusters_start, self.dip_merge_threshold,
                                                              self.cluster_loss_weight, self.n_clusters_max,
                                                              self.n_clusters_min, self.batch_size, self.learning_rate,
                                                              self.pretrain_epochs, self.dedc_epochs,
                                                              self.optimizer_class,
-                                                             self.loss_fn, self.autoencoder, self.embedding_size,
+                                                             self.loss_fn, self.autoencoder, self.inter_dim, self.embedding_size,
                                                              self.max_cluster_size_diff_factor, self.debug)
         self.labels_ = labels
         self.n_clusters_ = n_clusters
@@ -664,154 +595,36 @@ class DipDECK():
         self.autoencoder = autoencoder
 
 
-"""
-Data loader
-"""
-
-def _get_download_dir():
-    downloads_path = str(Path.home() / "Downloads/dipDECK_data")
-    if not os.path.isdir(downloads_path):
-        os.makedirs(downloads_path)
-    return downloads_path
-
-def _download_file(download_path, filename):
-    ssl._create_default_https_context = ssl._create_unverified_context
-    urllib.request.urlretrieve(download_path, filename)
-    ssl._create_default_https_context = ssl._create_default_https_context
-
-
-def _load_data_file(filename, download_path, delimiter=",", last_column_are_labels=True):
-    if not os.path.isfile(filename):
-        _download_file(download_path, filename)
-    datafile = np.genfromtxt(filename, delimiter=delimiter)
-    if last_column_are_labels:
-        data = datafile[:, :-1]
-        labels = datafile[:, -1]
-    else:
-        data = datafile[:, 1:]
-        labels = datafile[:, 0]
-    return data, labels
-
-def _load_torch_image_data(data_source, add_testdata):
-    # Get data from source
-    ssl._create_default_https_context = ssl._create_unverified_context
-    dataset = data_source(root=_get_download_dir(), train=True, download=True)
-    data = dataset.data
-    labels = dataset.targets
-    if add_testdata:
-        testset = data_source(root=_get_download_dir(), train=False, download=True)
-        data = torch.cat([data, testset.data], dim=0)
-        labels = torch.cat([labels, testset.targets], dim=0)
-    ssl._create_default_https_context = ssl._create_default_https_context
-    # Flatten shape
-    if data.dim() == 3:
-        data = data.reshape(-1, data.shape[1] * data.shape[2])
-    else:
-        data = data.reshape(-1, data.shape[1] * data.shape[2] * data.shape[3])
-    # Move data to CPU
-    data_cpu = data.detach().cpu().numpy()
-    labels_cpu = labels.detach().cpu().numpy()
-    return data_cpu, labels_cpu
-
-def _image_z_transformation(data):
-    return (data - np.mean(data)) / np.std(data)
-
-
-def load_mnist(add_testdata=True, normalize=True):
-    data, labels = _load_torch_image_data(torchvision.datasets.MNIST, add_testdata)
-    if normalize:
-        data = _image_z_transformation(data)
-    return data, labels
-
-
-def load_kmnist(add_testdata=True, normalize=True):
-    data, labels = _load_torch_image_data(torchvision.datasets.KMNIST, add_testdata)
-    if normalize:
-        data = _image_z_transformation(data)
-    return data, labels
-
-
-def load_fmnist(add_testdata=True, normalize=True):
-    data, labels = _load_torch_image_data(torchvision.datasets.FashionMNIST, add_testdata)
-    if normalize:
-        data = _image_z_transformation(data)
-    return data, labels
-
-
-def load_usps(add_testdata=True, normalize=True):
-    dataset = torchvision.datasets.USPS(root=_get_download_dir(), train=True, download=True)
-    data = dataset.data
-    labels = dataset.targets
-    if add_testdata:
-        test_dataset = torchvision.datasets.USPS(root=_get_download_dir(), train=False, download=True)
-        data = np.r_[data, test_dataset.data]
-        labels = np.r_[labels, test_dataset.targets]
-    data = data.reshape(-1, 256)
-    if normalize:
-        data = _image_z_transformation(data)
-    return data, labels
-
-def load_optdigits(add_testdata=True, normalize=True):
-    filename = _get_download_dir() + "/optdigits.tra"
-    data, labels = _load_data_file(filename,
-                                   "https://archive.ics.uci.edu/ml/machine-learning-databases/optdigits/optdigits.tra")
-    if add_testdata:
-        filename = _get_download_dir() + "/optdigits.tes"
-        test_data, test_labels = _load_data_file(filename,
-                                                 "https://archive.ics.uci.edu/ml/machine-learning-databases/optdigits/optdigits.tes")
-        data = np.r_[data, test_data]
-        labels = np.r_[labels, test_labels]
-    if normalize:
-        data = _image_z_transformation(data)
-    return data, labels
-
-def load_pendigits(add_testdata=True, normalize = True):
-    filename = _get_download_dir() + "/pendigits.tra"
-    data, labels = _load_data_file(filename,
-                                   "https://archive.ics.uci.edu/ml/machine-learning-databases/pendigits/pendigits.tra")
-    if add_testdata:
-        filename = _get_download_dir() + "/pendigits.tes"
-        test_data, test_labels = _load_data_file(filename,
-                                                 "https://archive.ics.uci.edu/ml/machine-learning-databases/pendigits/pendigits.tes")
-        data = np.r_[data, test_data]
-        labels = np.r_[labels, test_labels]
-    if normalize:
-        data = scale(data, axis=0)
-    return data, labels
-
-
-def load_letterrecognition(normalize = True):
-    filename = _get_download_dir() + "/letter-recognition.data"
-    if not os.path.isfile(filename):
-        _download_file(
-            "https://archive.ics.uci.edu/ml/machine-learning-databases/letter-recognition/letter-recognition.data",
-            filename)
-    # Transform letters to integers
-    letter_mappings = {"A": "0", "B": "1", "C": "2", "D": "3", "E": "4", "F": "5", "G": "6", "H": "7", "I": "8",
-                       "J": "9", "K": "10", "L": "11", "M": "12", "N": "13", "O": "14", "P": "15", "Q": "16",
-                       "R": "17", "S": "18", "T": "19", "U": "20", "V": "21", "W": "22", "X": "23", "Y": "24",
-                       "Z": "25"}
-    with open(filename, "r") as f:
-        file_text = f.read()
-    file_text = file_text.replace("\n", ",")
-    for k in letter_mappings.keys():
-        file_text = file_text.replace(k, letter_mappings[k])
-    # Create numpy array
-    datafile = np.fromstring(file_text, sep=",").reshape(-1, 17)
-    data = datafile[:, 1:]
-    labels = datafile[:, 0]
-    if normalize:
-        data = scale(data, axis=0)
-    return data, labels
 
 """
 Start DipDECK
 """
+import argparse
+from preprocess import *
+from datasets import *
+import logging
+import warnings
+
+warnings.filterwarnings( 'ignore' )
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", default="ADClust_datasets/Baron_Human_normalized.h5ad", help="data directory")
+    parser.add_argument("--ae_dim", default=[500,500,2000], help="AE intermidate dimensions")
+    parser.add_argument("--ae_embedding_dim", default=5, help="AE embedding dimension")
+    parser.add_argument("--trials", default=10, type=int, help="")
+    parser.add_argument("--initial_clustering_methods", default="kmeans", help="kmeans or louvain")
+
+    args = parser.parse_args()
+    print(args)
+    
+    # data, labels = prepro(args.data_dir)
+    data, labels = prepro_h5ad(args.data_dir)
+
+
     # === Choose data set ===
     # data, labels = load_usps()
-    data, labels = load_mnist()
+    # data, labels = load_mnist()
     # data, labels = load_fmnist()
     # data, labels = load_kmnist()
     # data, labels = load_optdigits()
@@ -819,10 +632,26 @@ if __name__ == "__main__":
     # data, labels = load_letterrecognition()
     # GTSRB can be downloaded at https://benchmark.ini.rub.de/gtsrb_news.html
 
-    # === Create DipDECK object ===
-    dipdeck = DipDECK()
-    dipdeck.fit(data)
 
-    # === Print results ===
-    print("K:", dipdeck.n_clusters_)
-    print("NMI:", nmi(labels, dipdeck.labels_))
+    Ks = []
+    NMIs = []
+    ARIs = []
+    for trial in range(args.trials):
+        # === Create DipDECK object ===
+        dipdeck = DipDECK(args, n_clusters_start=35, dip_merge_threshold=0.9, cluster_loss_weight=1, n_clusters_max=np.inf,
+                    n_clusters_min=1, batch_size=256, learning_rate=1e-3, pretrain_epochs=100, dedc_epochs=50,
+                    optimizer_class=torch.optim.Adam, loss_fn=torch.nn.MSELoss(), autoencoder=None, 
+                    inter_dim= args.ae_dim, embedding_size=args.ae_embedding_dim,
+                    max_cluster_size_diff_factor=2, debug=False)
+        dipdeck.fit(data)
+
+        # === Print results ===
+        Ks.append(dipdeck.n_clusters_)
+        print("K:", dipdeck.n_clusters_)
+        NMI = nmi(labels, dipdeck.labels_)
+        NMIs.append(NMI)
+        print("NMI:",NMI)
+        ARI = ari(labels, dipdeck.labels_)
+        ARIs.append(ARI)
+        print("ARI:" ,ARI)
+    print("Average K: {}, NMI: {:.3f}, ARI: {:.3f}".format(np.average(Ks),np.average(NMIs),np.average(ARIs)))

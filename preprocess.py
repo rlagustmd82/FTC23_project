@@ -49,18 +49,7 @@ def read_data(filename, sparsify = False, skip_exprs = False):
     return mat, obs, var, uns
 
 
-def prepro(filename):
-    data_path = filename
-    mat, obs, var, uns = read_data(data_path, sparsify=False, skip_exprs=False)
-    if isinstance(mat, np.ndarray):
-        X = np.array(mat)
-    else:
-        X = np.array(mat.toarray())
-    cell_name = np.array(obs["cell_type1"])
-    cell_type, cell_label = np.unique(cell_name, return_inverse=True)
-    return X, cell_label
-
-def normalize(adata, copy=True, highly_genes = None, filter_min_counts=True, size_factors=True, normalize_input=True, logtrans_input=True):
+def normalize_(adata, copy=True, highly_genes = None, filter_min_counts=True, size_factors=True, normalize_input=True, logtrans_input=True):
     if isinstance(adata, sc.AnnData):
         if copy:
             adata = adata.copy()
@@ -96,3 +85,27 @@ def normalize(adata, copy=True, highly_genes = None, filter_min_counts=True, siz
         sc.pp.scale(adata)
     return adata
 
+
+def prepro(filename):
+    data_path = filename
+    mat, obs, var, uns = read_data(data_path, sparsify=False, skip_exprs=False)
+    if isinstance(mat, np.ndarray):
+        X = np.array(mat)
+    else:
+        X = np.array(mat.toarray())
+    cell_name = np.array(obs["cell_type1"])
+    cell_type, cell_label = np.unique(cell_name, return_inverse=True)
+    X = normalize_(X)
+    return X, cell_label
+
+def prepro_h5ad(filename):
+    adata = sc.read_h5ad(filename)
+    data = adata.X.A
+
+    if 'CellType' in adata.obs:
+        if type(adata.obs['CellType'].values[0]) == str:
+            labels=adata.obs['CellType'].astype('category').cat.codes.astype('long').values
+        else:
+            labels=adata.obs['CellType'].values.astype(np.int32)
+
+    return data, labels
