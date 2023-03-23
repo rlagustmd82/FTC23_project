@@ -354,7 +354,8 @@ def _dip_deck(args, X, n_clusters_start, dip_merge_threshold, cluster_loss_weigh
         init_centers = kmeans.cluster_centers_
         cluster_labels_cpu = kmeans.labels_
     elif args.initial_clustering_methods == "louvain":
-        pass
+        embedded_data = encode_batchwise(testloader, autoencoder, device)
+        louvain = 0
     else:
         print("Not available clustering method!")
     # Get nearest points to optimal centers
@@ -609,19 +610,34 @@ warnings.filterwarnings( 'ignore' )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="ADClust_datasets/Baron_Human_normalized.h5ad", help="data directory")
-    parser.add_argument("--ae_dim", default=[500,500,2000], help="AE intermidate dimensions")
-    parser.add_argument("--ae_embedding_dim", default=5, help="AE embedding dimension")
+    parser.add_argument("--data_dir", default=["ADClust_datasets/Baron_Human_normalized.h5ad",
+                                                "ADClust_datasets/Baron_Mouse_normalized.h5ad",
+                                                "ADClust_datasets/Klein_normalized.h5ad",
+                                                "ADClust_datasets/Mouse_retina_normalized.h5ad",
+                                                "ADClust_datasets/PBMC_68k_normalized.h5ad",
+                                                "ADClust_datasets/Romanov_normalized.h5ad",
+                                                "ADClust_datasets/Segerstolpe_normalized.h5ad",
+                                                "ADClust_datasets/Tasic_normalized.h5ad",
+                                                "ADClust_datasets/TM_normalized.h5ad",
+                                                "ADClust_datasets/Xin_normalized.h5ad",
+                                                "ADClust_datasets/Zeisel_normalized.h5ad"
+                                                ], help="data directory")
+    parser.add_argument("--ae_dim", default=[500,500,2000], nargs='+', type=int, help="AE intermidate dimensions")
+    parser.add_argument("--ae_embedding_dim", default=5, type=int, help="AE embedding dimension")
     parser.add_argument("--trials", default=10, type=int, help="")
-    parser.add_argument("--initial_clustering_methods", default="kmeans", help="kmeans or louvain")
+    parser.add_argument("--initial_clustering_methods", default="kmeans", help="kmeans or louvain") # Not implemented yet
+    parser.add_argument("--log_dir", default="result.log", help="log directory")
 
     args = parser.parse_args()
     print(args)
-    
-    # data, labels = prepro(args.data_dir)
-    data, labels = prepro_h5ad(args.data_dir)
 
-
+    logging.basicConfig(filename=args.log_dir, level=logging.INFO)
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)s:%(message)s',
+        level=logging.INFO,
+        datefmt='%m/%d/%Y %I:%M:%S %p',
+    )
+    logging.info(args)
     # === Choose data set ===
     # data, labels = load_usps()
     # data, labels = load_mnist()
@@ -631,27 +647,41 @@ if __name__ == "__main__":
     # data, labels = load_pendigits()
     # data, labels = load_letterrecognition()
     # GTSRB can be downloaded at https://benchmark.ini.rub.de/gtsrb_news.html
+    
+    for data_dir in args.data_dir:
+        # data, labels = prepro(args.data_dir)
+        data, labels = prepro_h5ad(data_dir)
 
+        print("Dataset name: {}".format(data_dir.split('/')[-1]))
+        print("Dataset shape: {}".format(data.shape))
+        print("Class #: {}".format(len(set(labels.flatten()))))
+        logging.info("Dataset name: {} | Dataset shape: {} | Class #: {}".format(data_dir.split('/')[-1], data.shape, len(set(labels.flatten()))))
+        
+        Ks = []
+        NMIs = []
+        ARIs = []
+        for trial in range(args.trials):
+            print("\ntrial:", trial+1)
+            # === Create DipDECK object ===
+            dipdeck = DipDECK(args, n_clusters_start=35, dip_merge_threshold=0.9, cluster_loss_weight=1, n_clusters_max=np.inf,
+                        n_clusters_min=1, batch_size=256, learning_rate=1e-3, pretrain_epochs=100, dedc_epochs=50,
+                        optimizer_class=torch.optim.Adam, loss_fn=torch.nn.MSELoss(), autoencoder=None, 
+                        inter_dim= args.ae_dim, embedding_size=args.ae_embedding_dim,
+                        max_cluster_size_diff_factor=2, debug=False)
+            dipdeck.fit(data)
 
-    Ks = []
-    NMIs = []
-    ARIs = []
-    for trial in range(args.trials):
-        # === Create DipDECK object ===
-        dipdeck = DipDECK(args, n_clusters_start=35, dip_merge_threshold=0.9, cluster_loss_weight=1, n_clusters_max=np.inf,
-                    n_clusters_min=1, batch_size=256, learning_rate=1e-3, pretrain_epochs=100, dedc_epochs=50,
-                    optimizer_class=torch.optim.Adam, loss_fn=torch.nn.MSELoss(), autoencoder=None, 
-                    inter_dim= args.ae_dim, embedding_size=args.ae_embedding_dim,
-                    max_cluster_size_diff_factor=2, debug=False)
-        dipdeck.fit(data)
+            # === Print results ===
+            Ks.append(dipdeck.n_clusters_)
+            print("K:", dipdeck.n_clusters_)
+            NMI = nmi(labels, dipdeck.labels_)
+            NMIs.append(NMI)
+            print("NMI:",NMI)
+            ARI = ari(labels, dipdeck.labels_)
+            ARIs.append(ARI)
+            print("ARI:" ,ARI)
+            logging.info("Trial {} | K: {} | NMI: {:.3f} | ARI: {:.3f}".format(trial, dipdeck.n_clusters_, NMI, ARI))
 
-        # === Print results ===
-        Ks.append(dipdeck.n_clusters_)
-        print("K:", dipdeck.n_clusters_)
-        NMI = nmi(labels, dipdeck.labels_)
-        NMIs.append(NMI)
-        print("NMI:",NMI)
-        ARI = ari(labels, dipdeck.labels_)
-        ARIs.append(ARI)
-        print("ARI:" ,ARI)
-    print("Average K: {}, NMI: {:.3f}, ARI: {:.3f}".format(np.average(Ks),np.average(NMIs),np.average(ARIs)))
+        print("Average K: {}, NMI: {:.3f}, ARI: {:.3f}".format(np.average(Ks),np.average(NMIs),np.average(ARIs)))
+        logging.info("Average K: {}/{:.2f}, NMI: {:.3f}/{:.3f}, ARI: {:.3f}/{:.3f}\n".format(np.average(Ks),np.var(Ks),
+                                                                                np.average(NMIs),np.var(NMIs),
+                                                                                np.average(ARIs),np.var(ARIs)))

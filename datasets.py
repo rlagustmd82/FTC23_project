@@ -1,3 +1,10 @@
+from pathlib import Path
+import torchvision
+import urllib.request
+import os
+import ssl
+import zipfile
+
 """
 Data loader
 """
