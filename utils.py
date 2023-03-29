@@ -1,317 +1,326 @@
-import json
-import functools
-import operator
-import collections
-import jgraph
+# -*- coding: utf-8 -*-
+
 import numpy as np
-import scipy.sparse
-import tqdm
-from sklearn.decomposition import PCA
-
-class dotdict(dict):
-    __getattr__ = dict.get
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
+import matplotlib.pyplot as plt
+from scipy import sparse
+from scipy.sparse import spdiags
+from scipy.spatial.distance import pdist, squareform
+import pandas as pd
+from math import pow
 
 
 
-def dpt(times, h):
-    import scanpy as sc
-    import scipy.stats as stats
-    adata = sc.AnnData(X=h)
-    adata.obs['times'] = times
-    adata.uns['iroot'] = np.flatnonzero(adata.obs['times'] == 0)[0]
-    sc.tl.pca(adata, svd_solver='arpack')
-    sc.pp.neighbors(adata, n_neighbors=30, use_rep="X")
-    sc.tl.diffmap(adata)
-    sc.tl.dpt(adata)
-    ds = adata.obs["dpt_pseudotime"]
-    tau, p_value = stats.kendalltau(times, ds)
-    return tau, ds
+def getMembership(clus):
+    vv  = [val for sublist in clus for val in sublist]
+    membership = np.zeros(len(vv) , dtype = np.int8)
+    for i in range(len(clus)):
+        membership[clus[i]] = i
+    return membership
 
 
-def in_ipynb():  # pragma: no cover
-    try:
-        # noinspection PyUnresolvedReferences
-        shell = get_ipython().__class__.__name__
-        if shell == "ZMQInteractiveShell":
-            return True   # Jupyter notebook or qtconsole
-        elif shell == "TerminalInteractiveShell":
-            return False  # Terminal running IPython
+def getClusts(membership):
+    clusts = [np.where(membership == i) for i in np.unique(membership)]
+    return clusts
+    
+
+def Q(clusts, A):
+    q = 0
+    d = np.sum(np.sum(A), dtype=np.int64)
+    qArray = [ d * np.sum(np.sum(A[I][:,I])) - pow(np.sum(np.sum(A[I,:])) , 2) for I in clusts if len(I) > 0]
+    qArray = np.array(qArray, dtype=np.float64)
+    q = np.sum(qArray, dtype=np.int64)
+    q = q / (d * d + np.finfo(float).eps)
+    return q
+
+
+def simulatedBlock(n, m, p1, p2, randomize = 1):
+    '''
+    % [b, clus] = simulatedBlocks(n, m, p1, p2, randomize)
+    % n: number of nodes
+    % m: number of clusters
+    % p1: probability for two nodes in the same community to form an edge
+    % p2: probability for two nodes in different communities to form an edge
+    %     randomize: whether the nodes in the same community are placed together
+    %     (default = 1). when 0 is chosen, you can see the clustering structure
+    %     from imagesc(b).
+    % b: adjacency matrix.
+    % clus: real clusters
+    '''
+    b = np.random.rand(n,n)
+    s = n/m
+    clus = []
+    
+    # background
+    b = np.floor(b + p2)
+    allK = [range(int(np.round(s * (i))), int(np.round(s*(i+1)))) for i in range(m)]
+    for k in allK:
+        b[k[0]:k[-1]+1, k[0]:k[-1]+1] = np.floor(np.random.rand(len(k), len(k)) + p1) 
+        clus.append(k)
+        
+    b = b - np.diag(np.diag(b))
+    for i in range(n):
+        for j in range(i-1):
+            b[i,j] = b[j,i]
+        
+        
+    if randomize:
+        y = np.random.permutation(n)
+        b = b[y][:,y]
+        I = np.argsort(y)
+        clus = [I[c] for c in clus]
+        
+    b = sparse.csr_matrix(b) 
+    return b, clus
+        
+    
+def simulatedUnevenBlocks(n1, n2, r = 1):
+    '''
+    %% now fixed as: 1000 nodes, 1x 100 nodes, 3 x 40 nodes, 9 x    
+    %% 20 nodes, 40 x 15 nodes
+    '''
+    a = [100] + list(np.repeat(40, 3)) + list(np.repeat(20, 9)) + list(np.repeat(15, 40))
+    offDiag = 1000**2 - np.sum(np.array(a)**2)
+    p2 = n2 * 1000 / offDiag
+    
+    b = np.random.rand(1000,1000)
+    b = b < p2
+    I , J  = np.where(b)
+    s = np.where(I < J)
+    b = sparse.lil_matrix((np.ones(len(I[s])) , (I[s] , J[s])),shape = (1000,1000))
+    b = b + b.T
+    
+    x = 0
+    clus = []
+    for i in range(len(a)):
+        p1 = (n1 + np.log(a[i])) / a[i]
+        s = simulatedBlock(a[i] , 1, p1, 0)[0]
+        clus.append( x + np.array((range(a[i]))))
+        b[clus[i][0]:clus[i][-1]+1 , clus[i][0]:clus[i][-1]+1] = s
+        x = x + a[i]
+    if r:
+        y = np.random.permutation(1000)
+        b = b[y][:,y]
+        I = np.argsort(y)
+        clus = [I[c] for c in clus]
+    return b ,clus
+
+def simulatedUnevenBlocks2(n1, n2, r = 1):
+    '''
+    %% fixed as: 512 nodes, 1x 128 nodes, 2 x 64 nodes, 8 x    
+    %% 32 nodes
+    '''
+    a = [128,64,64] + list(np.repeat(32,8))
+    n=  np.sum(a)
+    
+    offDiag = n**2 - np.sum(np.array(a) ** 2)
+    p2 = n2 * n / offDiag
+    
+    b = np.random.rand(n,n)
+    b = b < p2
+    I, J = np.where(b)
+    s = np.where(I < J)
+    b = sparse.csr_matrix((np.ones(len(I[s])) , (I[s] , J[s])),shape = (n,n))
+    b = b + b.T
+    
+    x = 0
+    clus = []
+    for i in range(len(a)):
+        p1 = (n1 + np.log2(a[i])) / a[i]
+        s = simulatedBlock(a[i] , 1, p1, 0)[0]
+        clus.append( x + np.array((range(a[i]))))
+        b[clus[i][0]:clus[i][-1]+1 , clus[i][0]:clus[i][-1]+1] = s
+        x = x + a[i]
+    if r:
+        y = np.random.permutation(n)
+        b = b[y][:,y]
+        I = np.argsort(y)
+        clus = [I[c] for c in clus]
+    return b ,clus
+    
+    
+    
+def showClusters(a , clus, noLine = 0):
+    o = []
+    for c in clus:
+        o = list(o) + list(c)    
+    
+    l = 0.5
+    n = len(o) + 0.5
+    for i in clus:
+        l = l + len(i)
+        if ~noLine:
+            plt.plot([0,n], [l,l], c= 'red', linewidth = 0.3)
+            plt.plot([l,l], [0,n], c ='red', linewidth = 0.3)
+    plt.imshow(a[o][:,o]) 
+    
+# here 1-alpha is the restart probability
+def RWR(A, nSteps = 500, alpha = 0.5, p0 = None):
+    A = np.array(A)
+    n = A.shape[0]
+    if p0 == None:
+        p0 = np.eye(n)
+    #W = A * spdiags(sum(A)'.^(-1), 0, n, n);
+    #W = spdiags(np.power(sum(np.float64(A)) , -1).T  , 0, n, n).toarray()
+    W = A.dot(spdiags(np.power(sum(np.float64(A)) , -1)[np.newaxis],0, n, n).toarray() )
+    p = p0
+    pl2norm = np.inf
+    unchanged = 0
+    for i in range(1, nSteps+1):
+        if i % 100 == 0:
+            print('      done rwr ' + str(i-1) )
+            
+        pnew = (1 - alpha) * W.dot(p) + (alpha) * p0
+        l2norm = max(np.sqrt(sum((pnew - p) ** 2) ))
+        p = pnew
+        if l2norm < np.finfo(float).eps:
+            break
         else:
-            return False  # Other type (?)
-    except NameError:
-        return False      # Probably standard Python interpreter
-
-def smart_tqdm():  # pragma: no cover
-    if in_ipynb():
-        return tqdm.tqdm_notebook
-    return tqdm.tqdm
-
-def with_self_graph(fn):
-    @functools.wraps(fn)
-    def wrapped(self, *args, **kwargs):
-        with self.graph.as_default():
-            return fn(self, *args, **kwargs)
-    return wrapped
-
-# Wraps a batch function into minibatch version
-def minibatch(batch_size, desc, use_last=False, progress_bar=True):
-    def minibatch_wrapper(func):
-        @functools.wraps(func)
-        def wrapped_func(*args, **kwargs):
-            total_size = args[0].shape[0]
-            if use_last:
-                n_batch = np.ceil(
-                    total_size / float(batch_size)
-                ).astype(np.int)
+            if l2norm == pl2norm:
+                unchanged = unchanged +1
+                if unchanged > 10:
+                    break
             else:
-                n_batch = max(1, np.floor(
-                    total_size / float(batch_size)
-                ).astype(np.int))
-            for batch_idx in smart_tqdm()(
-                range(n_batch), desc=desc, unit="batches",
-                leave=False, disable=not progress_bar
-            ):
-                start = batch_idx * batch_size
-                end = min((batch_idx + 1) * batch_size, total_size)
-                this_args = (item[start:end] for item in args)
-                func(*this_args, **kwargs)
-        return wrapped_func
-    return minibatch_wrapper
-
-# Avoid sklearn warning
-def encode_integer(label, sort=False):
-    label = np.array(label).ravel()
-    classes = np.unique(label)
-    if sort:
-        classes.sort()
-    mapping = {v: i for i, v in enumerate(classes)}
-    return np.array([mapping[v] for v in label]), classes
-
-# Avoid sklearn warning
-def encode_onehot(label, sort=False, ignore=None):
-    i, c = encode_integer(label, sort)
-    onehot = scipy.sparse.csc_matrix((
-        np.ones_like(i, dtype=np.int32), (np.arange(i.size), i)
-    ))
-    if ignore is None:
-        ignore = []
-    return onehot[:, ~np.in1d(c, ignore)].tocsr()
-
-class CellTypeDAG(object):
-
-    def __init__(self, graph=None, vdict=None):
-        self.graph = jgraph.Graph(directed=True) if graph is None else graph
-        self.vdict = {} if vdict is None else vdict
-
-    @classmethod
-    def load(cls, file):
-        if file.endswith(".json"):
-            return cls.load_json(file)
-        elif file.endswith(".obo"):
-            return cls.load_obo(file)
-        else:
-            raise ValueError("Unexpected file format!")
-
-    @classmethod
-    def load_json(cls, file):
-        with open(file, "r") as f:
-            d = json.load(f)
-        dag = cls()
-        dag._build_tree(d)
-        return dag
-
-    @classmethod
-    def load_obo(cls, file):  # Only building on "is_a" relation between CL terms
-        import pronto
-        ont = pronto.Ontology(file)
-        graph, vdict = jgraph.Graph(directed=True), {}
-        for item in ont:
-            if not item.id.startswith("CL"):
-                continue
-            if "is_obsolete" in item.other and item.other["is_obsolete"][0] == "true":
-                continue
-            graph.add_vertex(
-                name=item.id, cell_ontology_class=item.name,
-                desc=str(item.desc), synonyms=[(
-                    "%s (%s)" % (syn.desc, syn.scope)
-                 ) for syn in item.synonyms]
-            )
-            assert item.id not in vdict
-            vdict[item.id] = item.id
-            assert item.name not in vdict
-            vdict[item.name] = item.id
-            for synonym in item.synonyms:
-                if synonym.scope == "EXACT" and synonym.desc != item.name:
-                    vdict[synonym.desc] = item.id
-        for source in graph.vs:
-            for relation in ont[source["name"]].relations:
-                if relation.obo_name != "is_a":
-                    continue
-                for target in ont[source["name"]].relations[relation]:
-                    if not target.id.startswith("CL"):
-                        continue
-                    graph.add_edge(
-                        source["name"],
-                        graph.vs.find(name=target.id.split()[0])["name"]
-                    )
-                    # Split because there are many "{is_infered...}" suffix,
-                    # falsely joined to the actual id when pronto parses the
-                    # obo file
-        return cls(graph, vdict)
-
-    def _build_tree(self, d, parent=None):  # For json loading
-        self.graph.add_vertex(name=d["name"])
-        v = self.graph.vs.find(d["name"])
-        if parent is not None:
-            self.graph.add_edge(v, parent)
-        self.vdict[d["name"]] = d["name"]
-        if "alias" in d:
-            for alias in d["alias"]:
-                self.vdict[alias] = d["name"]
-        if "children" in d:
-            for subd in d["children"]:
-                self._build_tree(subd, v)
-
-    def get_vertex(self, name):
-        return self.graph.vs.find(self.vdict[name])
-
-    def is_related(self, name1, name2):
-        return self.is_descendant_of(name1, name2) \
-            or self.is_ancestor_of(name1, name2)
-
-    def is_descendant_of(self, name1, name2):
-        if name1 not in self.vdict or name2 not in self.vdict:
-            return False
-        shortest_path = self.graph.shortest_paths(
-            self.get_vertex(name1), self.get_vertex(name2)
-        )[0][0]
-        return np.isfinite(shortest_path)
-
-    def is_ancestor_of(self, name1, name2):
-        if name1 not in self.vdict or name2 not in self.vdict:
-            return False
-        shortest_path = self.graph.shortest_paths(
-            self.get_vertex(name2), self.get_vertex(name1)
-        )[0][0]
-        return np.isfinite(shortest_path)
-
-    def conditional_prob(self, name1, name2):  # p(name1|name2)
-        if name1 not in self.vdict or name2 not in self.vdict:
-            return 0
-        self.graph.vs["prob"] = 0
-        v2_parents = list(self.graph.bfsiter(
-            self.get_vertex(name2), mode=jgraph.OUT))
-        v1_parents = list(self.graph.bfsiter(
-            self.get_vertex(name1), mode=jgraph.OUT))
-        for v in v2_parents:
-            v["prob"] = 1
-        while True:
-            changed = False
-            for v1_parent in v1_parents[::-1]:  # Reverse may be more efficient
-                if v1_parent["prob"] != 0:
-                    continue
-                v1_parent["prob"] = np.prod([
-                    v["prob"] / v.degree(mode=jgraph.IN)
-                    for v in v1_parent.neighbors(mode=jgraph.OUT)
-                ])
-                if v1_parent["prob"] != 0:
-                    changed = True
-            if not changed:
-                break
-        return self.get_vertex(name1)["prob"]
-
-    def similarity(self, name1, name2, method="probability"):
-        if method == "probability":
-            return (
-                self.conditional_prob(name1, name2) +
-                self.conditional_prob(name2, name1)
-            ) / 2
-        # if method == "distance":
-        #     return self.distance_ratio(name1, name2)
-        raise ValueError("Invalid method!")  # pragma: no cover
-
-    def count_reset(self):
-        self.graph.vs["raw_count"] = 0
-        self.graph.vs["prop_count"] = 0  # count propagated from children
-        self.graph.vs["count"] = 0
-
-    def count_set(self, name, count):
-        self.get_vertex(name)["raw_count"] = count
-
-    def count_update(self):
-        origins = [v for v in self.graph.vs.select(raw_count_gt=0)]
-        for origin in origins:
-            for v in self.graph.bfsiter(origin, mode=jgraph.OUT):
-                if v != origin:  # bfsiter includes the vertex self
-                    v["prop_count"] += origin["raw_count"]
-        self.graph.vs["count"] = list(map(
-            operator.add, self.graph.vs["raw_count"],
-            self.graph.vs["prop_count"]
-        ))
-
-    def best_leaves(self, thresh, retrieve="name"):
-        subgraph = self.graph.subgraph(self.graph.vs.select(count_ge=thresh))
-        leaves, max_count = [], 0
-        for leaf in subgraph.vs.select(lambda v: v.indegree() == 0):
-            if leaf["count"] > max_count:
-                max_count = leaf["count"]
-                leaves = [leaf[retrieve]]
-            elif leaf["count"] == max_count:
-                leaves.append(leaf[retrieve])
-        return leaves
+                unchanged = 0
+                pl2norm = l2norm
+    return p
 
 
-class DataDict(collections.OrderedDict):
+# construct gene-gene network by getting ED similarity matrix 
+def simToNetARank(sim, k=3):
+    print('start ARank ...')
+    # sim is similarity matrix and k is number of neighbors
+    # return A graph which two vertices are connected if one of them are in k negbor of the other one
+    np.fill_diagonal(sim, 0)
+    I = np.argsort(sim, axis = 0) + 1
+    I2 = (np.argsort(I, axis = 0) + 1)
+    net = I2 > (len(sim) - k)
+    net = np.logical_or(net, net.T)
+    np.fill_diagonal(net, False)  
+    net = net*1
+    return net
 
-    def shuffle(self, random_state=np.random):
-        shuffled = DataDict()
-        shuffle_idx = None
-        for item in self:
-            shuffle_idx = random_state.permutation(self[item].shape[0]) \
-                if shuffle_idx is None else shuffle_idx
-            shuffled[item] = self[item][shuffle_idx]
-        return shuffled
+def simToNetMRank(sim , k = 3):
+    print('start MRank ...'  , k )
+    np.fill_diagonal(sim, 0)
+    # sim is similarity matrix and k is num of neigbors
+    # return A graph which two vertices are connected if both of them are in k neighbor of the  other
+ 
+    I = np.argsort(sim, axis = 0) + 1
+    I = np.argsort(I, axis = 0) + 1
+    net = I >  (sim.shape[0] - k)
+    net = np.logical_and(net, net.T)
+    np.fill_diagonal(net, False)  
+    net = net*1
+    return net
 
-    @property
-    def size(self):
-        data_size = set([item.shape[0] for item in self.values()])
-        assert len(data_size) == 1
-        return data_size.pop()
+def eucliSim(data):
+    dist = pdist(data, 'euclidean')
+    dfDist = squareform(dist)
+    sim = 1 / ( 1 + dfDist)
+    np.fill_diagonal(sim, 0)
+    return sim
 
-    @property
-    def shape(self):  # Compatibility with numpy arrays
-        return [self.size]
+def simToNetThreshold(sim , thre):
+    print('start tNet ...', thre)
+    np.fill_diagonal(sim , 0)
+    sim = sim >= thre
+    sim = sim * 1
+    return sim
 
-    def __getitem__(self, fetch):
-        if isinstance(fetch, (slice, np.ndarray)):
-            return DataDict([
-                (item, self[item][fetch]) for item in self
-            ])
-        return super(DataDict, self).__getitem__(fetch)
+def readCountMat(name , sep = ','):
+    df = pd.read_table(name , sep = sep)
+    genes  = df.iloc[:,0]
+    df.index = genes
+    df = df.drop(df.columns[0] , 1)
+    print('number of genes: ', df.shape[0] , 'number of cells: ', df.shape[1])
+    return df
+
+def readLabels(fileName):
+    y = pd.read_table(fileName, sep = ',')
+    y , yy = y.iloc[:,1].factorize()
+    return y , yy
+
+# log2 transformation
+def logTransformation(df , offset = 1):
+    return np.log2(df + offset)
+
+# all cells have same sum counts
+def libSizeNorm(df):
+    libSize =  np.array(df.sum(0))
+    df = df / libSize * np.median(libSize)
+    return df
+
+# data preprossenig remove genes that have not been expressed 
+def preProssesing(data):
+    index = geneFilteringIndex(data , 0)
+    return data[~index,:]
+
+# gene filtering: filter the genes which has been expressed in less than m cell
+def geneFilteringIndex(df , m):
+    # m: each gene should have been expressed in at least m cells
+    geneFilterIndex = np.sum(df != 0 , 1) <= m
+    print(np.sum(geneFilterIndex) , ' genes have been removed')
+    return geneFilterIndex
+
+def aknn(dist , k = 3):
+    print('start ARank new ...')
+    # dist is distance matrix and k is number of neighbors
+    # return A graph which two vertices are connected if one of them are in k negbor of the other one
+    np.fill_diagonal(dist, np.inf)
+    I = np.argsort(dist, axis = 0) + 1
+    I2 = (np.argsort(I, axis = 0) + 1)
+    net = I2 <= k
+    net = np.logical_or(net, net.T)
+    np.fill_diagonal(net, False)  
+    net = net*1
+    return net
+
+def mknn(dist, k = 3):
+    print('start MRank new ...'  , k )
+    np.fill_diagonal(dist, np.inf)
+    # dist is distance matrix and k is num of neigbors
+    # return A graph which two vertices are connected if both of them are in k neighbor of the  other
+    I = np.argsort(dist, axis = 0) + 1
+    I = np.argsort(I, axis = 0) + 1
+    net = I <= k
+    net = np.logical_and(net, net.T)
+    np.fill_diagonal(net, False)  
+    net = net*1
+    return net
 
 
-def densify(arr):
-    if scipy.sparse.issparse(arr):
-        return arr.toarray()
-    return arr
+def aknnASym(dist , k = 3):
+    print('start aknnASym new ...')
+    # dist is distance matrix and k is number of neighbors
+    # return A graph which two vertices are connected if one of them are in k negbor of the other one
+    np.fill_diagonal(dist, np.inf)
+    I = np.argsort(dist, axis = 0) + 1
+    I2 = (np.argsort(I, axis = 0) + 1)
+    net = I2 <= k
+    #net = np.logical_or(net, net.T)
+    #np.fill_diagonal(net, False)  
+    #net = net*1
+    return net
+
+def aknnASymIndex(dist , k = 3):
+    print('start aknnASym new ...')
+    # dist is distance matrix and k is number of neighbors
+    # return A graph which two vertices are connected if one of them are in k negbor of the other one
+    np.fill_diagonal(dist, np.inf)
+    I = np.argsort(dist, axis = 0) + 1
+    I2 = (np.argsort(I, axis = 0) + 1)
+    I2[I2>k]= 0
+    return I2
 
 
-def empty_safe(fn, dtype):
-    def _fn(x):
-        if x.size:
-            return fn(x)
-        return x.astype(dtype)
-    return _fn
-
-def dopca(X, dim=10):
-    pcaten = PCA(n_components=dim)
-    X_10 = pcaten.fit_transform(X)
-    return X_10
-
-decode = empty_safe(np.vectorize(lambda _x: _x.decode("utf-8")), str)
-encode = empty_safe(np.vectorize(lambda _x: str(_x).encode("utf-8")), "S")
-upper = empty_safe(np.vectorize(lambda x: str(x).upper()), str)
-lower = empty_safe(np.vectorize(lambda x: str(x).lower()), str)
-tostr = empty_safe(np.vectorize(str), str)
+def aknnAsymWeighted(dist, k = 3):
+    print('start aknnASym new ...')
+    # dist is distance matrix and k is number of neighbors
+    # return A graph which two vertices are connected if one of them are in k negbor of the other one
+    sim = 1 / ( 1 + dist)
+    np.fill_diagonal(sim, 0)
+    I = np.argsort(sim, axis = 0) + 1
+    I2 = (np.argsort(I, axis = 0) + 1)
+    net = I2 > (len(sim) - k)
+    weightedNet = net * sim
+    return weightedNet
